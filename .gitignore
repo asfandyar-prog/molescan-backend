@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# uv / venv
+.venv/
+venv/
+.uv/
+
+# Env
+.env
+*.env
+
+# Model weights (large binaries — store in DVC or faculty server)
+weights/*.pt
+weights/*.pth
+weights/*.bin
+weights/*.safetensors
+
+# HuggingFace cache
+.cache/
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
