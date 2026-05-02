@@ -1,17 +1,25 @@
 """
 MoleScan ViT Classifier
 =======================
-Fine-tuned Vision Transformer (ViT-B/16) for 3-class mole classification.
+Fine-tuned Vision Transformer (ViT-B/16) for 3-class mole classification
+(healthy / suspicious / malignant).
 
-Novel contribution:
-    LayerNorm TTA — at inference time we run a few gradient steps that update
-    *only* the LayerNorm affine parameters (γ, β) to adapt the model to the
-    mobile camera's distribution shift, then reset them after prediction.
+At inference, this module can route forward passes through a LayerNorm-only
+entropy-minimization TTA wrapper (TENT, Wang et al. ICLR 2021; LayerNorm
+extension following TTT++, Liu et al. NeurIPS 2021). The wrapper itself
+lives in app.models.tta and is a faithful port of the thesis implementation.
+
+DEPLOYMENT NOTE — batch-size-1 is a known issue:
+    Entropy minimization is degenerate on a single image: the model can
+    drive entropy to zero by collapsing to any one class. The thesis adapts
+    on full test loaders. A FastAPI endpoint receives one image at a time.
+    The batch-size-1 fix is configured at the call site (see settings.tta_*
+    and the docstring on `predict()`); it is not silently absorbed here.
 
 TODO (Asfand):
-    - Load fine-tuned weights from `settings.model_weights_path`
-    - Implement `_layer_norm_tta()` using the ISIC validation loss as surrogate
-    - Calibrate `_uncertainty()` thresholds on a held-out ISIC split
+    - Drop fine-tuned ISIC weights into settings.model_weights_path.
+    - Decide on the batch-size-1 deployment fix (see settings.tta_mode).
+    - Calibrate uncertainty thresholds on a held-out ISIC split.
 """
 
 import logging
@@ -22,6 +30,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from app.core.config import settings
+from app.models.tta import LayerNormTTA
 from app.schemas.prediction import ClassLabel, PredictionResult
 
 logger = logging.getLogger(__name__)
@@ -32,14 +41,15 @@ CLASS_LABELS = [ClassLabel.healthy, ClassLabel.suspicious, ClassLabel.malignant]
 class MoleScanClassifier:
     def __init__(self) -> None:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = None
+        self.model = None       # base ViTForImageClassification
+        self.tta_model = None   # LayerNormTTA wrapper (or None if disabled)
         self.processor = None
         self._loaded = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def load(self) -> None:
-        """Load model and weights.  Called once at startup."""
+        """Load model and weights. Called once at startup via FastAPI lifespan."""
         try:
             from transformers import ViTForImageClassification, ViTImageProcessor
 
@@ -58,11 +68,34 @@ class MoleScanClassifier:
                 logger.info("Fine-tuned weights loaded from %s", weights_path)
             else:
                 logger.warning(
-                    "No weights found at %s — using ImageNet pre-trained backbone only.",
+                    "No weights at %s — using ImageNet-pretrained backbone only. "
+                    "Predictions will not be clinically meaningful until ISIC "
+                    "fine-tuning is complete.",
                     weights_path,
                 )
 
             self.model.to(self.device).eval()
+
+            if settings.tta_enabled:
+                self.tta_model = LayerNormTTA(
+                    self.model,
+                    lr=settings.tta_learning_rate,
+                    steps=settings.tta_steps,
+                    episodic=settings.tta_episodic,
+                    entropy_threshold=settings.tta_entropy_threshold,
+                ).to(self.device)
+                logger.info(
+                    "TTA wrapper attached: lr=%.0e steps=%d episodic=%s "
+                    "entropy_threshold=%s adaptable_params=%d",
+                    settings.tta_learning_rate,
+                    settings.tta_steps,
+                    settings.tta_episodic,
+                    settings.tta_entropy_threshold,
+                    self.tta_model.num_adaptable_params,
+                )
+            else:
+                logger.info("TTA disabled — using base ViT forward pass.")
+
             self._loaded = True
             logger.info("Classifier ready on %s", self.device)
 
@@ -76,21 +109,28 @@ class MoleScanClassifier:
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
-    @torch.no_grad()
     def predict(self, image: Image.Image) -> PredictionResult:
-        """Run classification (+ optional LayerNorm TTA) on a PIL image."""
+        """Run classification on a single PIL image.
+
+        Routing depends on `settings.tta_enabled` and the deployment fix
+        chosen for batch-size-1 (see settings.tta_entropy_threshold). With
+        a high entropy threshold, single confident requests bypass adaptation
+        and only rare batched/uncertain inputs trigger TTA.
+        """
         if not self._loaded:
             raise RuntimeError("Classifier not loaded. Call .load() first.")
 
         inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+        pixel_values = inputs["pixel_values"]
 
-        if settings.tta_enabled:
-            logits = self._layer_norm_tta(inputs)
+        if self.tta_model is not None:
+            # LayerNormTTA returns logits and handles its own grad context.
+            logits = self.tta_model(pixel_values)
         else:
-            outputs = self.model(**inputs)
-            logits = outputs.logits
+            with torch.no_grad():
+                logits = self.model(pixel_values=pixel_values).logits
 
-        probs = F.softmax(logits, dim=-1).squeeze()
+        probs = F.softmax(logits, dim=-1).squeeze(0)
         confidence, pred_idx = probs.max(dim=-1)
 
         label = CLASS_LABELS[pred_idx.item()]
@@ -101,35 +141,6 @@ class MoleScanClassifier:
             confidence=confidence.item(),
             class_probs=class_probs,
         )
-
-    # ── LayerNorm TTA (novel contribution) ────────────────────────────────────
-
-    def _layer_norm_tta(self, inputs: dict) -> torch.Tensor:
-        """
-        Adapt LayerNorm affine parameters to the test image distribution,
-        then restore original parameters after prediction.
-
-        This compensates for the distribution shift introduced by the
-        digital microscope used in the mobile app.
-
-        Reference:  TTT++ / Test-Time Training with Self-Supervision
-                    Wang et al. 2020 (Tent)
-        """
-        # TODO: implement full TTA loop
-        # Skeleton:
-        #   1. collect all LayerNorm modules
-        #   2. save original (weight, bias) pairs
-        #   3. optimise with AdamW for `settings.tta_steps` steps
-        #      using entropy minimisation as the surrogate loss
-        #   4. run final forward pass
-        #   5. restore original parameters
-        #   6. return logits
-
-        # Fallback — standard forward pass until TTA is implemented
-        logger.debug("TTA not yet implemented — falling back to standard forward pass.")
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-        return outputs.logits
 
 
 # Module-level singleton — imported by routes
