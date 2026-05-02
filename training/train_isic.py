@@ -1,17 +1,16 @@
 """
 MoleScan ViT-B/16 fine-tuning on ISIC 2019.
 
-This script is designed to run end-to-end inside a Kaggle notebook with a
-T4 or P100 GPU. The output is a single .pt file containing the fine-tuned
-state_dict, which the FastAPI backend loads at startup.
+Dataset:
+    Prasad Maharana / salviohexia, "ISIC 2019 Skin Lesion images for
+    classification" on Kaggle. 25,331 images organized in per-class
+    subfolders (AK/, BCC/, BKL/, DF/, MEL/, NV/, SCC/, VASC/) plus the
+    official ground-truth CSV.
 
 Class mapping (ISIC 2019 8-class → MoleScan 3-class):
     healthy:    NV, BKL, DF, VASC
     suspicious: AK, BCC
     malignant:  MEL, SCC
-
-Hyperparameters are standard ViT fine-tuning defaults — see the README for
-justification. Everything is configurable through the Config class.
 
 Output (saved to /kaggle/working/):
     molescan_vit.pt        - fine-tuned state_dict (drop into backend/weights/)
@@ -56,13 +55,12 @@ from transformers import (
 
 @dataclass
 class Config:
-    # Paths — VERIFY THESE ON KAGGLE before running.
-    # The exact path depends on which ISIC 2019 dataset you attach.
-    # Common patterns:
-    #   /kaggle/input/isic-2019/ISIC_2019_Training_Input/...
-    #   /kaggle/input/isic-2019/ISIC_2019_Training_GroundTruth.csv
-    image_dir: str = "/kaggle/input/isic-2019/ISIC_2019_Training_Input/ISIC_2019_Training_Input"
-    labels_csv: str = "/kaggle/input/isic-2019/ISIC_2019_Training_GroundTruth.csv"
+    # Verified Kaggle paths (Prasad Maharana / salviohexia ISIC 2019 dataset)
+    dataset_root: str = (
+        "/kaggle/input/datasets/salviohexia/"
+        "isic-2019-skin-lesion-images-for-classification"
+    )
+    labels_csv_name: str = "ISIC_2019_Training_GroundTruth.csv"
     out_dir: str = "/kaggle/working"
 
     # Model
@@ -99,6 +97,7 @@ ISIC_8_TO_3 = {
     "DF": "healthy",
     "VASC": "healthy",
 }
+ISIC_LABEL_COLS = ["MEL", "NV", "BCC", "AK", "BKL", "DF", "VASC", "SCC"]
 CLASS_NAMES = ["healthy", "suspicious", "malignant"]
 CLASS_TO_IDX = {c: i for i, c in enumerate(CLASS_NAMES)}
 
@@ -120,29 +119,52 @@ def set_seed(seed: int) -> None:
 # DATA
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_labels(csv_path: str) -> pd.DataFrame:
-    """Load ISIC 2019 ground truth CSV and map 8 classes → 3.
+def load_labels(cfg: Config) -> pd.DataFrame:
+    """Load ISIC 2019 ground-truth CSV, map 8 classes → 3, and locate each
+    image's per-class subfolder.
 
     The CSV has columns: image, MEL, NV, BCC, AK, BKL, DF, VASC, SCC, UNK
     Each row has exactly one column set to 1.0 (one-hot).
+
+    The dataset organizes images in per-class subfolders, so we use the
+    8-class label to construct each image's full path.
     """
+    csv_path = Path(cfg.dataset_root) / cfg.labels_csv_name
     df = pd.read_csv(csv_path)
-    label_cols = ["MEL", "NV", "BCC", "AK", "BKL", "DF", "VASC", "SCC"]
 
     # Drop rows labelled UNK or with no positive label
-    df = df[df[label_cols].sum(axis=1) == 1].copy()
+    df = df[df[ISIC_LABEL_COLS].sum(axis=1) == 1].copy()
 
-    df["isic_label"] = df[label_cols].idxmax(axis=1)
+    # 8-class string label
+    df["isic_label"] = df[ISIC_LABEL_COLS].idxmax(axis=1)
+
+    # 3-class MoleScan label
     df["molescan_label"] = df["isic_label"].map(ISIC_8_TO_3)
     df["label_idx"] = df["molescan_label"].map(CLASS_TO_IDX)
+
+    # Construct full image path: <root>/<isic_label>/<image>.jpg
+    root = Path(cfg.dataset_root)
+    df["image_path"] = df.apply(
+        lambda r: str(root / r["isic_label"] / f"{r['image']}.jpg"),
+        axis=1,
+    )
+
+    # Verify a small sample exists (catches path mistakes early).
+    sample_paths = df["image_path"].sample(min(10, len(df)), random_state=cfg.seed)
+    missing = [p for p in sample_paths if not Path(p).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"{len(missing)}/10 sample images not found. First missing: {missing[0]}\n"
+            f"Check Config.dataset_root: {cfg.dataset_root}"
+        )
 
     print(f"Loaded {len(df)} labelled images.")
     print("Class distribution (3-class):")
     print(df["molescan_label"].value_counts())
-    print("Original ISIC distribution:")
+    print("\nOriginal ISIC distribution:")
     print(df["isic_label"].value_counts())
 
-    return df[["image", "isic_label", "molescan_label", "label_idx"]].reset_index(drop=True)
+    return df[["image", "image_path", "isic_label", "molescan_label", "label_idx"]].reset_index(drop=True)
 
 
 def stratified_split(df: pd.DataFrame, cfg: Config):
@@ -160,29 +182,34 @@ def stratified_split(df: pd.DataFrame, cfg: Config):
         stratify=train_val_df["label_idx"],
         random_state=cfg.seed,
     )
-    print(f"Split sizes — train: {len(train_df)}  val: {len(val_df)}  test: {len(test_df)}")
-    return train_df.reset_index(drop=True), val_df.reset_index(drop=True), test_df.reset_index(drop=True)
+    print(f"\nSplit sizes — train: {len(train_df)}  val: {len(val_df)}  test: {len(test_df)}")
+    return (
+        train_df.reset_index(drop=True),
+        val_df.reset_index(drop=True),
+        test_df.reset_index(drop=True),
+    )
 
 
 class ISIC2019Dataset(Dataset):
-    """ISIC 2019 dataset wrapping the official ground truth CSV."""
+    """ISIC 2019 dataset wrapping the official ground-truth CSV.
+
+    Reads images directly from each row's pre-resolved `image_path` column.
+    """
 
     def __init__(
         self,
         df: pd.DataFrame,
-        image_dir: str,
         processor: ViTImageProcessor,
         augment: bool = False,
         image_size: int = 224,
     ) -> None:
         self.df = df.reset_index(drop=True)
-        self.image_dir = Path(image_dir)
         self.processor = processor
         self.image_size = image_size
 
         if augment:
             # Conservative medical-imaging augmentations.
-            # Moles are rotation-invariant so flips/rotations are safe.
+            # Moles are rotation-invariant, so flips/rotations are safe.
             # Mild color jitter compensates for lighting differences.
             self.transform = transforms.Compose([
                 transforms.Resize((image_size, image_size)),
@@ -199,8 +226,7 @@ class ISIC2019Dataset(Dataset):
 
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
-        img_path = self.image_dir / f"{row['image']}.jpg"
-        img = Image.open(img_path).convert("RGB")
+        img = Image.open(row["image_path"]).convert("RGB")
         img = self.transform(img)
 
         # ViTImageProcessor handles ImageNet normalization to match the
@@ -216,7 +242,7 @@ def compute_class_weights(df: pd.DataFrame, num_classes: int) -> torch.Tensor:
     """Inverse-frequency class weights for weighted cross-entropy."""
     counts = df["label_idx"].value_counts().sort_index().to_numpy()
     weights = counts.sum() / (num_classes * counts)
-    print(f"Class weights: {dict(zip(CLASS_NAMES, weights.round(3)))}")
+    print(f"\nClass weights: {dict(zip(CLASS_NAMES, weights.round(3)))}")
     return torch.tensor(weights, dtype=torch.float32)
 
 
@@ -326,20 +352,26 @@ def main(cfg: Config = CFG) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Data ─────────────────────────────────────────────────────────────────
-    df = load_labels(cfg.labels_csv)
+    df = load_labels(cfg)
     train_df, val_df, test_df = stratified_split(df, cfg)
 
     processor = ViTImageProcessor.from_pretrained(cfg.model_name)
-    train_ds = ISIC2019Dataset(train_df, cfg.image_dir, processor, augment=True, image_size=cfg.image_size)
-    val_ds = ISIC2019Dataset(val_df, cfg.image_dir, processor, augment=False, image_size=cfg.image_size)
-    test_ds = ISIC2019Dataset(test_df, cfg.image_dir, processor, augment=False, image_size=cfg.image_size)
+    train_ds = ISIC2019Dataset(train_df, processor, augment=True, image_size=cfg.image_size)
+    val_ds = ISIC2019Dataset(val_df, processor, augment=False, image_size=cfg.image_size)
+    test_ds = ISIC2019Dataset(test_df, processor, augment=False, image_size=cfg.image_size)
 
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
-                              num_workers=cfg.num_workers, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
-                            num_workers=cfg.num_workers, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False,
-                             num_workers=cfg.num_workers, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg.batch_size, shuffle=True,
+        num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=cfg.batch_size, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=True,
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=cfg.batch_size, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=True,
+    )
 
     # ── Model ────────────────────────────────────────────────────────────────
     model = ViTForImageClassification.from_pretrained(
@@ -349,7 +381,7 @@ def main(cfg: Config = CFG) -> None:
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable parameters: {n_params:,}")
+    print(f"\nTrainable parameters: {n_params:,}")
 
     # ── Optimizer / scheduler / loss ─────────────────────────────────────────
     optimizer = torch.optim.AdamW(
