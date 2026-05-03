@@ -13,7 +13,7 @@ RUN uv pip install --system --no-cache -e ".[dev]" 2>/dev/null || \
 # ── Stage 2: runtime image ────────────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
 
-LABEL maintainer="Asfand Yar <asfandyar@mailbox.unideb.u>"
+LABEL maintainer="Asfand Yar <asfandyar@mailbox.unideb.hu>"
 LABEL description="MoleScan backend — CITDS 2026"
 
 WORKDIR /app
